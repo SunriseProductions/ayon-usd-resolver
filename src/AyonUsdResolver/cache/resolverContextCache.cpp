@@ -29,6 +29,18 @@ PXR_NAMESPACE_USING_DIRECTIVE
 
 static std::mutex s_memcachedMutex;
 
+// Convert an absolute resolved path to its rootless form ("{root[work]}/...") using the
+// site roots, so a cached value can be re-rooted per platform/site via rootReplace on read.
+static std::string
+_ToRootlessPath(const std::string &resolvedPath, const std::unordered_map<std::string, std::string> &rootReplaceData) {
+    for (const auto &[key, root]: rootReplaceData) {
+        if (!root.empty() && resolvedPath.rfind(root, 0) == 0) {
+            return "{root[" + key + "]}" + resolvedPath.substr(root.size());
+        }
+    }
+    return resolvedPath;
+}
+
 // TODO pinning file hanlder should construct its cache directly at construction getAssetData should not call
 // rootReplace
 PinningFileHandler::PinningFileHandler(const std::string &pinningFilePath,
@@ -222,11 +234,50 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
         return resolved;
     }
 
+    // Memcached first: any URI already resolved by another session, machine or DCC costs a
+    // local-network lookup instead of a slot in the batched server request. Without this the
+    // prewarm pass would re-resolve the whole frontier server-side on every machine, and the
+    // per-asset _Resolve() calls afterwards would all hit PreCache — so the shared cache
+    // would never be read.
+    std::vector<std::string> misses;
+    if (m_memcached.has_value() && m_memcached->get()->isConnected()) {
+        misses.reserve(uriPaths.size());
+        for (const auto &uriPath: uriPaths) {
+            // Lock per call, not around the loop: s_memcachedMutex is process-wide, so holding
+            // it for a whole frontier would stall every other resolver thread's memcached path
+            // for the length of the prewarm.
+            AssetIdentifier asset;
+            {
+                std::lock_guard<std::mutex> lock(s_memcachedMutex);
+                asset = m_memcached->get()->getAssetData(uriPath);
+            }
+            if (asset.isEmpty()) {
+                misses.push_back(uriPath);
+                continue;
+            }
+            // Cached values are rootless; apply this site's roots before use.
+            std::string resolvedPath =
+                ynput::tool::ayon::rootReplace(asset.getResolvedAssetPath().GetPathString(), m_rootReplaceData);
+            asset.setResolvedAssetPath(ArResolvedPath(resolvedPath));
+            this->insert(asset);
+            resolved.emplace(asset.getAssetIdentifier(), resolvedPath);
+        }
+        TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
+            .Msg("ResolverContextCache::batchWarm: memcached %zu hits, %zu misses \n", resolved.size(), misses.size());
+    }
+    else {
+        misses = uriPaths;
+    }
+
+    if (misses.empty()) {
+        return resolved;
+    }
+
     // One batched request over the persistent keep-alive client: few round-trips,
     // deterministic, connection reused.
-    resolved = m_ayon->get()->batchResolvePathSerial(uriPaths);
+    std::unordered_map<std::string, std::string> fetched = m_ayon->get()->batchResolvePathSerial(misses);
 
-    for (const auto &entry: resolved) {
+    for (const auto &entry: fetched) {
         if (entry.first.empty() || entry.second.empty()) {
             continue;
         }
@@ -234,7 +285,24 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
         asset.setAssetIdentifier(entry.first);
         asset.setResolvedAssetPath(entry.second);
         this->insert(asset);
+        resolved.emplace(entry.first, entry.second);
     }
+
+    // Write the freshly resolved entries through, so the next session/machine on this
+    // memcached instance prewarms without touching the AYON server at all.
+    if (m_memcached.has_value() && m_memcached->get()->isConnected()) {
+        for (const auto &entry: fetched) {
+            if (entry.first.empty() || entry.second.empty()) {
+                continue;
+            }
+            const std::string rootlessPath = _ToRootlessPath(entry.second, m_rootReplaceData);
+            std::lock_guard<std::mutex> lock(s_memcachedMutex);
+            m_memcached->get()->setAssetData(entry.first, rootlessPath);
+        }
+        TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
+            .Msg("ResolverContextCache::batchWarm: stored %zu rootless results in memcached \n", fetched.size());
+    }
+
     return resolved;
 };
 
@@ -337,13 +405,7 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
         // Store the rootless path (e.g. {root[work]}/...) so that other platforms can apply
         // their own root via rootReplace on retrieval.
         if (m_memcached.has_value() && m_memcached->get()->isConnected() && !asset.isEmpty()) {
-            std::string rootlessPath = asset.getResolvedAssetPath().GetPathString();
-            for (const auto &[key, root] : m_rootReplaceData) {
-                if (!root.empty() && rootlessPath.rfind(root, 0) == 0) {
-                    rootlessPath = "{root[" + key + "]}" + rootlessPath.substr(root.size());
-                    break;
-                }
-            }
+            std::string rootlessPath = _ToRootlessPath(asset.getResolvedAssetPath().GetPathString(), m_rootReplaceData);
             std::lock_guard<std::mutex> lock(s_memcachedMutex);
             m_memcached->get()->setAssetData(asset.getAssetIdentifier(), rootlessPath);
             TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
