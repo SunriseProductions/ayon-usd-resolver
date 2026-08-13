@@ -26,6 +26,6 @@ __pycache__/
 tests/testVenv/
 
 # local build / install artifacts
-build_usd/
-install/
+build_*
+install
 *.log
