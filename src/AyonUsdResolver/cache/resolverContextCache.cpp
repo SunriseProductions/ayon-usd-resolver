@@ -373,9 +373,17 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
 
     // Try memcached as second-level cache before calling REST API
     if (m_memcached.has_value() && m_memcached->get()->isConnected()) {
-        std::lock_guard<std::mutex> lock(s_memcachedMutex);
         TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT).Msg("ResolverContextCache::getAsset: Checking memcached\n");
-        asset = m_memcached->get()->getAssetData(assetIdentifier);
+        // Scope the lock to the memcached call only. insert() below takes the PreCache and
+        // AyonCache unique locks, while removeCachedObject()/ClearCache() take those cache
+        // locks FIRST and then s_memcachedMutex -- holding the memcached mutex across
+        // insert() is the opposite order and deadlocks. Both of those are exposed to Python
+        // (wrapResolverContext), so a "clear resolver cache" call racing composition threads
+        // can wedge the DCC permanently.
+        {
+            std::lock_guard<std::mutex> lock(s_memcachedMutex);
+            asset = m_memcached->get()->getAssetData(assetIdentifier);
+        }
         if (!asset.isEmpty()) {
             // Apply root replacement to convert rootless path to absolute path
             std::string resolvedPath = ynput::tool::ayon::rootReplace(
