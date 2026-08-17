@@ -79,6 +79,15 @@ class ResolverContextCache {
         std::unordered_map<std::string, std::string> batchWarm(std::vector<std::string> &uriPaths);
 
         /**
+         * @brief Resolved path for a URI already held by an in-process cache, if any.
+         *
+         * Lets batchWarm() skip a memcached round trip for URIs PreCache/AyonCache/CommonCache
+         * can already answer. Returns the path (so the prewarm BFS can still descend through
+         * the layer) rather than a bare bool.
+         */
+        std::optional<std::string> inProcessResolved(const std::string &uriPath) const;
+
+        /**
          * @brief Set up the cache from a pinning file
          * @param pinningFilePath Path to the pinning file
          */

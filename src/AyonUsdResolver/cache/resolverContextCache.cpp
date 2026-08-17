@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -224,6 +225,33 @@ ResolverContextCache::migratePreCacheIntoAyonCache() {
     m_PreCache.clear();
 };
 
+std::optional<std::string>
+ResolverContextCache::inProcessResolved(const std::string &uriPath) const {
+    const AssetIdentifier key(uriPath);
+    {
+        std::shared_lock<std::shared_mutex> lock(m_PreCacheSharedMutex);
+        auto hit = m_PreCache.find(key);
+        if (hit != m_PreCache.end()) {
+            return hit->getResolvedAssetPath().GetPathString();
+        }
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(m_AyonCacheSharedMutex);
+        auto hit = m_AyonCache.find(key);
+        if (hit != m_AyonCache.end()) {
+            return hit->getResolvedAssetPath().GetPathString();
+        }
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(m_CommonCacheSharedMutex);
+        auto hit = m_CommonCache.find(key);
+        if (hit != m_CommonCache.end()) {
+            return hit->getResolvedAssetPath().GetPathString();
+        }
+    }
+    return std::nullopt;
+};
+
 std::unordered_map<std::string, std::string>
 ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
@@ -239,10 +267,29 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
     // prewarm pass would re-resolve the whole frontier server-side on every machine, and the
     // per-asset _Resolve() calls afterwards would all hit PreCache — so the shared cache
     // would never be read.
+    // Drop URIs an in-process cache can already answer. memcached gets are one network round
+    // trip EACH (serial — libmemcached, no mget), so re-querying what PreCache already holds is
+    // pure cost, and it compounds per stage: a 24-stage session issued ~3623 gets where 470
+    // suffice. Their paths still go into `resolved` so the prewarm BFS can descend through them.
+    std::vector<std::string> pending;
+    pending.reserve(uriPaths.size());
+    for (const auto &uriPath: uriPaths) {
+        if (std::optional<std::string> cached = inProcessResolved(uriPath); cached.has_value()) {
+            resolved.emplace(uriPath, *cached);
+            continue;
+        }
+        pending.push_back(uriPath);
+    }
+    if (pending.empty()) {
+        TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
+            .Msg("ResolverContextCache::batchWarm: all %zu uris already cached in-process \n", uriPaths.size());
+        return resolved;
+    }
+
     std::vector<std::string> misses;
     if (m_memcached.has_value() && m_memcached->get()->isConnected()) {
-        misses.reserve(uriPaths.size());
-        for (const auto &uriPath: uriPaths) {
+        misses.reserve(pending.size());
+        for (const auto &uriPath: pending) {
             // Lock per call, not around the loop: s_memcachedMutex is process-wide, so holding
             // it for a whole frontier would stall every other resolver thread's memcached path
             // for the length of the prewarm.
@@ -266,7 +313,7 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
             .Msg("ResolverContextCache::batchWarm: memcached %zu hits, %zu misses \n", resolved.size(), misses.size());
     }
     else {
-        misses = uriPaths;
+        misses = pending;
     }
 
     if (misses.empty()) {
