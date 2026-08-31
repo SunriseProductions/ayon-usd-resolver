@@ -3,9 +3,31 @@
 #include "appDataFolder.h"
 #include "AyonCppApi.h"
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+
+namespace {
+/// Case-insensitive, bounds-safe read of the file-logging flag.
+///
+/// Enables file logging only on an explicit affirmative; anything else --
+/// including an empty value -- leaves it off. Replaces a `switch (value[1])`
+/// that read past the NUL terminator for an empty string (undefined behaviour)
+/// and treated a lowercase "off" as ON, because only 'F' matched.
+bool
+fileLoggingIsEnabled(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return normalized == "on" || normalized == "1" || normalized == "true";
+}
+}   // namespace
 
 std::unique_ptr<AyonApi>
 getAyonApiFromEnv() {
@@ -48,18 +70,26 @@ getAyonApiFromEnv() {
     }
 
     std::cout << "before fileLoggerFilePath - " << envVarFileLoggingPath << std::endl;
-    std::string fileLoggerFilePath;
-    if (envVarFileLoggingPath != nullptr && envVarFileLogging != nullptr) {
-        switch (envVarFileLogging[1]) {
-            case 'F':
-                std::cout << "file logging is OFF" << std::endl;
-                break;
-            default:
-                std::cout << "file logging is ON" << std::endl;
-                fileLoggerFilePath
-                    = std::filesystem::absolute(std::string(envVarFileLoggingPath) + "/logFile.json").string();
-                break;
+    // Stays std::nullopt unless file logging is both enabled AND given a path.
+    // AyonApi takes std::optional<std::string>, so passing "" here yields an
+    // *engaged* optional holding an empty string: AyonCppApi builds predating
+    // ynput/ayon-cpp-api@63702e0 gate on has_value() alone, let it through, and
+    // resolve it to std::filesystem::temp_directory_path() -- then try to open
+    // that directory as a log file.
+    std::optional<std::string> fileLoggerFilePath;
+    if (fileLoggingIsEnabled(envVarFileLogging)) {
+        if (envVarFileLoggingPath[0] == '\0') {
+            // Without this, absolute("" + "/logFile.json") writes to /logFile.json.
+            std::cout << "file logging is ON but the log path is empty; leaving it off" << std::endl;
         }
+        else {
+            std::cout << "file logging is ON" << std::endl;
+            fileLoggerFilePath
+                = std::filesystem::absolute(std::string(envVarFileLoggingPath) + "/logFile.json").string();
+        }
+    }
+    else {
+        std::cout << "file logging is OFF" << std::endl;
     }
     std::cout << "before api init" << std::endl;
     std::unique_ptr<AyonApi> api
