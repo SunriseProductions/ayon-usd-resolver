@@ -477,13 +477,8 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
         // Store the rootless path (e.g. {root[work]}/...) so that other platforms can apply
         // their own root via rootReplace on retrieval.
         if (m_memcached.has_value() && m_memcached->get()->isConnected() && !asset.isEmpty()) {
-            std::string rootlessPath = _ToRootlessPath(asset.getResolvedAssetPath().GetPathString(), m_rootReplaceData);
-            for (const auto &[key, root] : m_rootReplaceData) {
-                if (!root.empty() && rootlessPath.rfind(root, 0) == 0) {
-                    rootlessPath = "{root[" + key + "]}" + rootlessPath.substr(root.size());
-                    break;
-                }
-            }
+            const std::string rootlessPath
+                = _ToRootlessPath(asset.getResolvedAssetPath().GetPathString(), m_rootReplaceData);
             std::lock_guard<std::mutex> lock(s_memcachedMutex);
             m_memcached->get()->setAssetData(asset.getAssetIdentifier(), rootlessPath);
             TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
