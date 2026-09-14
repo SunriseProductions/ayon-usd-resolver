@@ -18,9 +18,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <utility>
 
@@ -28,14 +30,21 @@ PXR_NAMESPACE_USING_DIRECTIVE
 
 static std::mutex s_memcachedMutex;
 
+// Convert an absolute resolved path to its rootless form ("{root[work]}/...") using the
+// site roots, so a cached value can be re-rooted per platform/site via rootReplace on read.
+//
+// NB rootReplaceData maps root NAME -> root PATH ({"work": "/mnt/projects"}), which is how
+// AyonApi::rootReplace consumes it on the read side (m_siteRoots.at("work")). Destructuring it
+// as [root, replacement] and testing path.find(root) tests the path against the NAME, never
+// matches, and silently returns the absolute path -- which resolves fine on the machine that
+// wrote it and breaks every other platform and site.
 static std::string _ToRootlessPath(
     const std::string &resolvedPath,
-    const std::unordered_map<std::string,
-    std::string> &rootReplaceData) {
+    const std::unordered_map<std::string, std::string> &rootReplaceData) {
     std::string rootlessPath = resolvedPath;
-    for (const auto &[root, replacement] : rootReplaceData) {
-        if (rootlessPath.find(root) == 0) {
-            rootlessPath.replace(0, root.length(), replacement);
+    for (const auto &[key, root] : rootReplaceData) {
+        if (!root.empty() && rootlessPath.rfind(root, 0) == 0) {
+            rootlessPath = "{root[" + key + "]}" + rootlessPath.substr(root.size());
             break;
         }
     }
@@ -455,16 +464,6 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
     }
 
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT).Msg("ResolverContextCache::getAsset: No Cache Hit \n");
-    // Scope the lock to the memcached call only. insert() below takes the PreCache and
-    // AyonCache unique locks, while removeCachedObject()/ClearCache() take those cache
-    // locks FIRST and then s_memcachedMutex -- holding the memcached mutex across
-    // insert() is the opposite order and deadlocks. Both of those are exposed to Python
-    // (wrapResolverContext), so a "clear resolver cache" call racing composition threads
-    // can wedge the DCC permanently.
-    {
-        std::lock_guard<std::mutex> lock(s_memcachedMutex);
-        asset = m_memcached->get()->getAssetData(assetIdentifier);
-    }
     if (isAyonPath) {
         std::pair<std::string, std::string> resolvedAsset = m_ayon->get()->resolvePath(assetIdentifier);
 
