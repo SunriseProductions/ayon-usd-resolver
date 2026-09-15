@@ -30,14 +30,9 @@ PXR_NAMESPACE_USING_DIRECTIVE
 
 static std::mutex s_memcachedMutex;
 
-// Convert an absolute resolved path to its rootless form ("{root[work]}/...") using the
-// site roots, so a cached value can be re-rooted per platform/site via rootReplace on read.
-//
-// NB rootReplaceData maps root NAME -> root PATH ({"work": "/mnt/projects"}), which is how
-// AyonApi::rootReplace consumes it on the read side (m_siteRoots.at("work")). Destructuring it
-// as [root, replacement] and testing path.find(root) tests the path against the NAME, never
-// matches, and silently returns the absolute path -- which resolves fine on the machine that
-// wrote it and breaks every other platform and site.
+// Absolute path -> rootless ("{root[work]}/..."), so any site can re-root it on read.
+// NB rootReplaceData maps root NAME -> root PATH; destructure it the other way round and the
+// match never fires, silently caching absolute paths that break every other site.
 static std::string _ToRootlessPath(
     const std::string &resolvedPath,
     const std::unordered_map<std::string, std::string> &rootReplaceData) {

@@ -24,12 +24,8 @@ PXR_NAMESPACE_USING_DIRECTIVE
  * @brief Parse memcached server string into host:port pairs
  */
 namespace {
-/// Warn on a memcached failure, on a channel that is actually on by default.
-///
-/// TF_DEBUG is opt-in and goes nowhere unless someone sets the env var, so a cache that is timing
-/// out on every lookup is otherwise invisible: memcached itself cannot see a client-side timeout
-/// (there is no such counter in `stats`), and the resolver exports none. This is the only place
-/// the condition can be observed, so it is logged unconditionally at warn level for log scraping.
+/// Warn on a memcached failure. Unconditional: TF_DEBUG is opt-in, and neither memcached nor the
+/// resolver exposes a client-side timeout counter, so this is the only place it can be observed.
 void
 logMemcachedFailure(const char* op, const std::string &key, const char* reason) {
     auto & logger = AyonLogger::getInstance();
@@ -39,12 +35,8 @@ logMemcachedFailure(const char* op, const std::string &key, const char* reason) 
     logger.warn(logger.key(kLogKeyName), "memcached {} failed: {} (key: {})", op, reason, key);
 }
 
-/// Warn that the cache is unavailable for this whole process.
-///
-/// This is the common production failure -- a region's memcached down when the DCC launches --
-/// and it is otherwise completely silent: the construction probe disables the handler, so no
-/// per-lookup failure is ever logged either. Resolves still succeed via the API, just slower,
-/// so nothing surfaces unless this line does.
+/// Warn that the cache is unavailable for this process. Silent otherwise: the construction probe
+/// disables the handler, so no per-lookup failure follows, and resolves still succeed via the API.
 void
 logMemcachedUnavailable(const std::string &servers, const char* reason) {
     auto & logger = AyonLogger::getInstance();
