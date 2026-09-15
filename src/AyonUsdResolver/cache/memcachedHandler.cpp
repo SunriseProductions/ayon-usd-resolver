@@ -9,6 +9,8 @@
 #include "libmemcached-1.0/memcached.h"
 #endif
 
+#include "ynput/lib/logging/AyonLogger.hpp"
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -21,6 +23,41 @@ PXR_NAMESPACE_USING_DIRECTIVE
 /**
  * @brief Parse memcached server string into host:port pairs
  */
+namespace {
+/// Warn on a memcached failure, on a channel that is actually on by default.
+///
+/// TF_DEBUG is opt-in and goes nowhere unless someone sets the env var, so a cache that is timing
+/// out on every lookup is otherwise invisible: memcached itself cannot see a client-side timeout
+/// (there is no such counter in `stats`), and the resolver exports none. This is the only place
+/// the condition can be observed, so it is logged unconditionally at warn level for log scraping.
+void
+logMemcachedFailure(const char* op, const std::string &key, const char* reason) {
+    auto & logger = AyonLogger::getInstance();
+    static const std::string kLogKeyName = "memcached";
+    static const bool kRegistered = logger.registerLoggingKey(kLogKeyName);
+    (void)kRegistered;
+    logger.warn(logger.key(kLogKeyName), "memcached {} failed: {} (key: {})", op, reason, key);
+}
+
+/// Warn that the cache is unavailable for this whole process.
+///
+/// This is the common production failure -- a region's memcached down when the DCC launches --
+/// and it is otherwise completely silent: the construction probe disables the handler, so no
+/// per-lookup failure is ever logged either. Resolves still succeed via the API, just slower,
+/// so nothing surfaces unless this line does.
+void
+logMemcachedUnavailable(const std::string &servers, const char* reason) {
+    auto & logger = AyonLogger::getInstance();
+    static const std::string kLogKeyName = "memcached";
+    static const bool kRegistered = logger.registerLoggingKey(kLogKeyName);
+    (void)kRegistered;
+    logger.warn(logger.key(kLogKeyName),
+                "memcached unavailable: {} (servers: {}) -- cache disabled for this process, "
+                "resolves go to the API",
+                reason, servers);
+}
+}   // namespace
+
 static std::vector<std::pair<std::string, uint16_t>> parseMemcachedServers(const std::string &serversStr) {
     std::vector<std::pair<std::string, uint16_t>> servers;
     std::istringstream iss(serversStr);
@@ -123,6 +160,14 @@ class MemcachedHandler::Impl {
             // check the memcached servers health
             memcached_return_t probe = memcached_version(m_memc);
             if (memcached_failed(probe)) {
+                std::string serverList;
+                for (const auto &[host, port]: m_servers) {
+                    if (!serverList.empty()) {
+                        serverList += ",";
+                    }
+                    serverList += host + ":" + std::to_string(port);
+                }
+                logMemcachedUnavailable(serverList, memcached_strerror(m_memc, probe));
                 TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
                     .Msg("MemcachedHandler: no server answered (%s): disabling memcached client "
                          "in this process.\n",
@@ -152,10 +197,7 @@ class MemcachedHandler::Impl {
             }
 
             if (memcached_failed(rc) || value == nullptr) {
-                TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
-                    .Msg("MemcachedHandler: get failed for key %s (%s)\n",
-                         key.c_str(),
-                         memcached_strerror(m_memc, rc));
+                logMemcachedFailure("get", key, memcached_strerror(m_memc, rc));
                 return "";
             }
 
@@ -177,10 +219,7 @@ class MemcachedHandler::Impl {
                                                   static_cast<time_t>(expireSeconds),
                                                   0);
             if (memcached_failed(rc)) {
-                TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
-                    .Msg("MemcachedHandler: set failed for key %s (%s)\n",
-                         key.c_str(),
-                         memcached_strerror(m_memc, rc));
+                logMemcachedFailure("set", key, memcached_strerror(m_memc, rc));
                 return false;
             }
 
