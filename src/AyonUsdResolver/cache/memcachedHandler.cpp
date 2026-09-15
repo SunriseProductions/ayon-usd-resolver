@@ -9,6 +9,8 @@
 #include "libmemcached-1.0/memcached.h"
 #endif
 
+#include "AyonLogger.hpp"
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -21,6 +23,23 @@ PXR_NAMESPACE_USING_DIRECTIVE
 /**
  * @brief Parse memcached server string into host:port pairs
  */
+namespace {
+/// Warn on a memcached failure, on a channel that is actually on by default.
+///
+/// TF_DEBUG is opt-in and goes nowhere unless someone sets the env var, so a cache that is timing
+/// out on every lookup is otherwise invisible: memcached itself cannot see a client-side timeout
+/// (there is no such counter in `stats`), and the resolver exports none. This is the only place
+/// the condition can be observed, so it is logged unconditionally at warn level for log scraping.
+void
+logMemcachedFailure(const char* op, const std::string &key, const char* reason) {
+    auto & logger = AyonLogger::getInstance();
+    static const std::string kLogKeyName = "memcached";
+    static const bool kRegistered = logger.registerLoggingKey(kLogKeyName);
+    (void)kRegistered;
+    logger.warn(logger.key(kLogKeyName), "memcached {} failed: {} (key: {})", op, reason, key);
+}
+}   // namespace
+
 static std::vector<std::pair<std::string, uint16_t>> parseMemcachedServers(const std::string &serversStr) {
     std::vector<std::pair<std::string, uint16_t>> servers;
     std::istringstream iss(serversStr);
@@ -152,10 +171,7 @@ class MemcachedHandler::Impl {
             }
 
             if (memcached_failed(rc) || value == nullptr) {
-                TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
-                    .Msg("MemcachedHandler: get failed for key %s (%s)\n",
-                         key.c_str(),
-                         memcached_strerror(m_memc, rc));
+                logMemcachedFailure("get", key, memcached_strerror(m_memc, rc));
                 return "";
             }
 
@@ -177,10 +193,7 @@ class MemcachedHandler::Impl {
                                                   static_cast<time_t>(expireSeconds),
                                                   0);
             if (memcached_failed(rc)) {
-                TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
-                    .Msg("MemcachedHandler: set failed for key %s (%s)\n",
-                         key.c_str(),
-                         memcached_strerror(m_memc, rc));
+                logMemcachedFailure("set", key, memcached_strerror(m_memc, rc));
                 return false;
             }
 
