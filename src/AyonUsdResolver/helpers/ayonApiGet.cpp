@@ -11,12 +11,7 @@
 #include <string>
 
 namespace {
-/// Case-insensitive, bounds-safe read of the file-logging flag.
-///
-/// Enables file logging only on an explicit affirmative; anything else --
-/// including an empty value -- leaves it off. Replaces a `switch (value[1])`
-/// that read past the NUL terminator for an empty string (undefined behaviour)
-/// and treated a lowercase "off" as ON, because only 'F' matched.
+/// True only on an explicit affirmative; anything else, including empty, is off.
 bool
 fileLoggingIsEnabled(const char* value) {
     if (value == nullptr) {
@@ -69,27 +64,18 @@ getAyonApiFromEnv() {
         AYON_SITE_ID = AYON_SITE_ID_ENV;
     }
 
-    std::cout << "before fileLoggerFilePath - " << envVarFileLoggingPath << std::endl;
-    // Stays std::nullopt unless file logging is both enabled AND given a path.
-    // AyonApi takes std::optional<std::string>, so passing "" here yields an
-    // *engaged* optional holding an empty string: AyonCppApi builds predating
-    // ynput/ayon-cpp-api@63702e0 gate on has_value() alone, let it through, and
-    // resolve it to std::filesystem::temp_directory_path() -- then try to open
-    // that directory as a log file.
+    // Must stay disengaged unless logging is enabled AND given a path: an engaged-but-empty
+    // optional resolves to temp_directory_path(), which AyonCppApi then opens as a log file.
     std::optional<std::string> fileLoggerFilePath;
     if (fileLoggingIsEnabled(envVarFileLogging)) {
         if (envVarFileLoggingPath[0] == '\0') {
-            // Without this, absolute("" + "/logFile.json") writes to /logFile.json.
-            std::cout << "file logging is ON but the log path is empty; leaving it off" << std::endl;
+            std::cout << "file logging enabled but AYON_USD_RESOLVER_LOG_FILE is empty; staying off" << std::endl;
         }
         else {
-            std::cout << "file logging is ON" << std::endl;
             fileLoggerFilePath
                 = std::filesystem::absolute(std::string(envVarFileLoggingPath) + "/logFile.json").string();
+            std::cout << "file logging -> " << *fileLoggerFilePath << std::endl;
         }
-    }
-    else {
-        std::cout << "file logging is OFF" << std::endl;
     }
     std::cout << "before api init" << std::endl;
     std::unique_ptr<AyonApi> api
