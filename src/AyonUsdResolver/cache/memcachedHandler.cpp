@@ -38,6 +38,24 @@ logMemcachedFailure(const char* op, const std::string &key, const char* reason) 
     (void)kRegistered;
     logger.warn(logger.key(kLogKeyName), "memcached {} failed: {} (key: {})", op, reason, key);
 }
+
+/// Warn that the cache is unavailable for this whole process.
+///
+/// This is the common production failure -- a region's memcached down when the DCC launches --
+/// and it is otherwise completely silent: the construction probe disables the handler, so no
+/// per-lookup failure is ever logged either. Resolves still succeed via the API, just slower,
+/// so nothing surfaces unless this line does.
+void
+logMemcachedUnavailable(const std::string &servers, const char* reason) {
+    auto & logger = AyonLogger::getInstance();
+    static const std::string kLogKeyName = "memcached";
+    static const bool kRegistered = logger.registerLoggingKey(kLogKeyName);
+    (void)kRegistered;
+    logger.warn(logger.key(kLogKeyName),
+                "memcached unavailable: {} (servers: {}) -- cache disabled for this process, "
+                "resolves go to the API",
+                reason, servers);
+}
 }   // namespace
 
 static std::vector<std::pair<std::string, uint16_t>> parseMemcachedServers(const std::string &serversStr) {
@@ -142,6 +160,14 @@ class MemcachedHandler::Impl {
             // check the memcached servers health
             memcached_return_t probe = memcached_version(m_memc);
             if (memcached_failed(probe)) {
+                std::string serverList;
+                for (const auto &[host, port]: m_servers) {
+                    if (!serverList.empty()) {
+                        serverList += ",";
+                    }
+                    serverList += host + ":" + std::to_string(port);
+                }
+                logMemcachedUnavailable(serverList, memcached_strerror(m_memc, probe));
                 TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
                     .Msg("MemcachedHandler: no server answered (%s): disabling memcached client "
                          "in this process.\n",
