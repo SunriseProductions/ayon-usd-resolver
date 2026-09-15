@@ -9,7 +9,7 @@
 #include "libmemcached-1.0/memcached.h"
 #endif
 
-#include "AyonLogger.hpp"
+#include "ynput/lib/logging/AyonLogger.hpp"
 
 #include <cstdlib>
 #include <iostream>
