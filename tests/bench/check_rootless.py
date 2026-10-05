@@ -29,6 +29,13 @@ class Reader:
         self.sock = sock
         self.buf = b""
 
+    def _fill(self) -> None:
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            msg = "memcached closed the connection mid-reply"
+            raise ConnectionError(msg)
+        self.buf += chunk
+
     def line(self) -> bytes:
         """Read one CRLF-terminated protocol line.
 
@@ -36,7 +43,7 @@ class Reader:
             The line, without its terminator.
         """
         while b"\r\n" not in self.buf:
-            self.buf += self.sock.recv(65536)
+            self._fill()
         out, self.buf = self.buf.split(b"\r\n", 1)
         return out
 
@@ -47,7 +54,7 @@ class Reader:
             The decoded value.
         """
         while len(self.buf) < size + 2:
-            self.buf += self.sock.recv(65536)
+            self._fill()
         val, self.buf = self.buf[:size].decode(), self.buf[size + 2 :]
         return val
 

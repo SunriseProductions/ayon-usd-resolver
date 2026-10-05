@@ -109,14 +109,11 @@ if TYPE_CHECKING:
 
 PREWARM_OFF_VALUES = {"0", "false"}
 
-# Blackhole endpoint for the 6-degraded cell. Must be UNROUTABLE, not merely closed: a
-# closed port answers ECONNREFUSED instantly and measures nothing, while an unroutable
-# address leaves libmemcached's connect/poll hanging for the full AYON_MEMCACHED_TIMEOUT_MS
-# on every lookup — the failure mode the cell exists to price. Override: --degraded-server.
-# Unroutable by design: a connect here must HANG (packets dropped), not be refused, or the
-# "cache configured but dead" cell measures a fast failure instead of a real timeout. Verify
-# on your network -- a host that answers ICMP-unreachable makes this cell meaningless. Override
-# with --degraded-server.
+# Blackhole endpoint for the 6-degraded cells. Must be UNROUTABLE, not merely closed: a
+# closed port answers ECONNREFUSED instantly, while an unroutable address makes the resolver's
+# construction-time health probe hang for the full AYON_MEMCACHED_TIMEOUT_MS — the cost the
+# cells exist to price. Verify on your network (an ICMP-unreachable answer makes the cell
+# meaningless). Override: --degraded-server.
 DEGRADED_MEMCACHED_SERVER = (
     "192.0.2.1:11211"  # RFC 5737 TEST-NET-1: routes nowhere, never refuses
 )
@@ -143,13 +140,13 @@ def _memcached_cmd(server: str, command: str, terminator: bytes) -> str:
             (host, int(port or 11211)), timeout=5
         ) as sock:
             sock.sendall(command.encode() + b"\r\n")
-            chunks: list[bytes] = []
-            while terminator not in b"".join(chunks[-2:]):
+            buf = b""
+            while terminator not in buf:
                 chunk = sock.recv(4096)
                 if not chunk:
                     break
-                chunks.append(chunk)
-            return b"".join(chunks).decode(errors="replace")
+                buf += chunk
+            return buf.decode(errors="replace")
     except (OSError, ValueError) as exc:
         print(f"[warn] memcached {server}: {command}: {exc}", file=sys.stderr)
         return ""
@@ -279,18 +276,14 @@ def load_multi_roots(path: str) -> list[str]:
         sys.exit(
             f"{path}: expected a JSON list of {{level, uri|uris}} objects"
         )
-    multi = [
-        uri
-        for entry in entries
-        if isinstance(entry, dict)
-        for uri in entry.get("uris", [])
-    ]
+    # Stable sort: entries sharing a level keep their file order.
+    entries = sorted(
+        (entry for entry in entries if isinstance(entry, dict)),
+        key=lambda entry: entry.get("level", 0),
+    )
+    multi = [uri for entry in entries for uri in entry.get("uris", [])]
     if not multi:
-        multi = [
-            entry["uri"]
-            for entry in entries
-            if isinstance(entry, dict) and "uri" in entry
-        ]
+        multi = [entry["uri"] for entry in entries if "uri" in entry]
     return [str(uri) for uri in multi]
 
 
@@ -339,20 +332,25 @@ def prewarm_enabled_from_env() -> bool:
 
 
 def resolver_plugin_path() -> str:
-    """Which ayonUsdResolver actually answered — provenance for every CSV row.
+    """Library path(s) of every registered ayonUsdResolver — provenance for every CSV row.
 
-    Scheme registration only proves *a* resolver claims ayon://, not that it is the build
-    under test. Without this a matrix run against the wrong .so looks identical.
+    Without this a matrix run against the wrong .so looks identical. More than one entry
+    (';'-joined) means several builds are on PXR_PLUGINPATH_NAME and the row is ambiguous.
 
     Returns:
-        Filesystem path of the resolver that answered, or `""` if none did.
+        The resolver library path(s), or the plugin path env if none is registered.
     """
     try:
         from pxr import Plug
 
-        for plugin in Plug.Registry().GetAllPlugins():
-            if "ayonusdresolver" in plugin.name.lower().replace("_", ""):
-                return str(plugin.path)
+        # For a library plugin, PlugPlugin.path is its plugInfo LibraryPath.
+        paths = [
+            str(plugin.path)
+            for plugin in Plug.Registry().GetAllPlugins()
+            if "ayonusdresolver" in plugin.name.lower().replace("_", "")
+        ]
+        if paths:
+            return ";".join(paths)
     except Exception as exc:  # noqa: BLE001 - provenance is best-effort, never fatal
         print(
             f"[warn] could not read the plugin registry: {exc}",
@@ -614,19 +612,18 @@ CELLS: list[tuple[str, dict[str, str], bool, bool]] = [
         True,
         True,
     ),
-    # memcached configured but unreachable: the resolver's isConnected() does no network I/O
-    # (memcached_server_push parses, never connects), so the handler reports connected and every
-    # lookup blocks for the full timeout. Servers come from --degraded-server, never --memcached,
-    # and the cell runs even without --memcached — it needs no real server.
+    # memcached configured but unreachable at launch: the construction-time health probe blocks
+    # for one AYON_MEMCACHED_TIMEOUT_MS, then the client is disabled and every lookup falls
+    # through to AYON. A cache dying MID-session (per-lookup timeouts) is not measured here.
+    # Servers come from --degraded-server, never --memcached; the cell needs no real server.
     (
         "6-degraded",
         {"AYON_RESOLVER_NO_PREWARM": "0", "AYON_MEMCACHED_ENABLED": "true"},
         False,
         False,
     ),
-    # Same unreachable server, prewarm OFF. Cell 6 understates the cost of a dead cache
-    # because batchWarm resolves most of the closure without ever asking memcached; with
-    # prewarm off every URI goes through getAsset(), so every URI eats the full timeout.
+    # Same unreachable server, prewarm OFF: every URI goes through getAsset()'s AYON
+    # fall-through instead of batchWarm, so compare against 0-baseline, not 1-prewarm-only.
     (
         "6b-degraded-noprewarm",
         {"AYON_RESOLVER_NO_PREWARM": "1", "AYON_MEMCACHED_ENABLED": "true"},
@@ -792,7 +789,7 @@ def _write_csv(rows: list[dict[str, Any]], out: str) -> None:
         writer.writerows(rows)
 
 
-def _run_level(  # noqa: C901 - one branch per cell kind; flattening is what keeps them comparable
+def _run_level(  # noqa: C901, PLR0912 - one branch per cell kind; flattening is what keeps them comparable
     args: argparse.Namespace,
     kinds: list[str],
     rtt: int | None,
@@ -808,9 +805,9 @@ def _run_level(  # noqa: C901 - one branch per cell kind; flattening is what kee
         if degraded:
             overrides["AYON_MEMCACHED_SERVERS"] = args.degraded_server
             print(
-                f"[warn] {name}: memcached deliberately unreachable ({args.degraded_server}) — every lookup "
-                f"blocks for AYON_MEMCACHED_TIMEOUT_MS ({args.timeout_ms or 1000}ms); at ~200 URIs x 1s "
-                "this cell takes MINUTES by design",
+                f"[warn] {name}: memcached deliberately unreachable ({args.degraded_server}) — the startup "
+                f"health probe blocks for AYON_MEMCACHED_TIMEOUT_MS ({args.timeout_ms or 1000}ms), then the "
+                "cache is disabled for the process",
                 file=sys.stderr,
             )
         if overrides.get(PINNING_GATE) == "true":
@@ -855,6 +852,10 @@ def _run_level(  # noqa: C901 - one branch per cell kind; flattening is what kee
                         f"{name}: warm-up wrote nothing to memcached — the cache is not warm."
                     )
             row = _measure(args, name, overrides, kind, rtt, degraded=degraded)
+            if row.get("error"):
+                abort(
+                    f"{name} ({kind}): probe failed, no measurement: {row['error']}"
+                )
             if row.get("composed") is False:
                 abort(
                     f"{name} ({kind}): a probed stage composed 0 prims — its ayon:// URIs failed to "
@@ -1000,9 +1001,16 @@ def cmd_probe(args: argparse.Namespace) -> int:
             )
     elif len(roots) != 1:
         sys.exit(f"probe --kind {args.kind} needs exactly one --root")
-    # NB: verification resolves verify_uri before measurement, seeding PreCache (and possibly
-    # memcached) with that ONE entry — noise against a real closure, but pick a verify URI
-    # outside --uris/--root if single-URI purity matters.
+    # Measure FIRST: verifying resolves verify_uri, which would seed PreCache (and memcached)
+    # and turn a cold cell warm. A broken resolver still fails the probe, just afterwards.
+    if args.kind == "stage":
+        measured = probe_stage(roots[0])
+    elif args.kind == "multi":
+        measured = probe_multi(multi_roots)
+    else:
+        with pathlib.Path(args.uris).open(encoding="utf-8") as handle:
+            uris = [line.strip() for line in handle if line.strip()]
+        measured = probe_resolve(uris, args.repeats)
     _assert_resolver(args.verify_uri, allow_missing=args.allow_no_resolver)
     result: dict[str, Any] = {
         "prewarm": prewarm_enabled_from_env(),
@@ -1012,15 +1020,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         and ayon_resolver_loaded(args.verify_uri),
         "uri_schemes": _registered_uri_schemes(),  # diagnostic only — see _registered_uri_schemes
         "resolver_plugin": resolver_plugin_path(),
+        **measured,
     }
-    if args.kind == "stage":
-        result.update(probe_stage(roots[0]))
-    elif args.kind == "multi":
-        result.update(probe_multi(multi_roots))
-    else:
-        with pathlib.Path(args.uris).open(encoding="utf-8") as handle:
-            uris = [line.strip() for line in handle if line.strip()]
-        result.update(probe_resolve(uris, args.repeats))
     print(json.dumps(result))
     return 0
 

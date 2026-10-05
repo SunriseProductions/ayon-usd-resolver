@@ -56,7 +56,7 @@ it still behave correctly when it is cold, warm, or unreachable.
     --rtt-ms 0 --rtt-ms 150 --ayon-proxy-url http://toxiproxy:15000 \
     --out results.csv
 
-# cache contract: exits non-zero if any sampled value is absolute
+# cache contract: exits non-zero if any sampled value is absolute or empty
 python3 check_rootless.py cache-host:11211 pins.json
 ```
 
@@ -70,6 +70,9 @@ URI resolves to nothing whether the resolver works or not.
 `0-baseline` (no prewarm, no cache) · `1-prewarm-only` · `2-memcache-cold` · `3-memcache-warm` ·
 `4-both-cold` · `5-both-warm` · `6-degraded` (cache configured but unreachable) ·
 `6b-degraded-noprewarm` · `7/8/9-pinning` (needs `--pin-file`)
+
+The degraded cells price a cache that is dead **at launch** (one startup timeout, then fall-through
+to AYON). A cache that dies mid-session is not covered.
 
 `--only <substring>` runs a subset, so a new axis can be added to an existing result set without
 re-measuring what you already have.
@@ -101,6 +104,6 @@ Two caveats before quoting numbers:
 
 - **Single runs, not averages.** Repeats of the same configuration can vary appreciably, most of it
   on the sub-second rows. Treat them as order-of-magnitude, or add repeats.
-- **The dead-cache penalty scales with `AYON_MEMCACHED_TIMEOUT_MS`, not closure size**, because
-  libmemcached backs off a failed server rather than timing out per lookup. Any measurement of that
-  cell is meaningless without its timeout.
+- **The dead-cache penalty scales with `AYON_MEMCACHED_TIMEOUT_MS`, not closure size**, because the
+  resolver's startup health probe disables an unreachable cache for the whole process. Any measurement
+  of that cell is meaningless without its timeout.
