@@ -719,7 +719,8 @@ def run_cell(  # noqa: C901 - a flat sequence of guards; splitting it hides the 
         cmd, env=env, capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
-        return {"error": (proc.stderr or "probe failed").strip()[:500]}
+        # Tail, not head: DCC startup noise fills the head; the reason is last.
+        return {"error": (proc.stderr or "probe failed").strip()[-2000:]}
     for line in reversed(proc.stdout.splitlines()):
         if not line.startswith("{"):
             continue
@@ -806,7 +807,7 @@ def _run_level(  # noqa: C901, PLR0912 - one branch per cell kind; flattening is
             overrides["AYON_MEMCACHED_SERVERS"] = args.degraded_server
             print(
                 f"[warn] {name}: memcached deliberately unreachable ({args.degraded_server}) — the startup "
-                f"health probe blocks for AYON_MEMCACHED_TIMEOUT_MS ({args.timeout_ms or 1000}ms), then the "
+                f"health probe blocks for AYON_MEMCACHED_TIMEOUT_MS ({args.timeout_ms or os.environ.get('AYON_MEMCACHED_TIMEOUT_MS', '1000')}ms), then the "
                 "cache is disabled for the process",
                 file=sys.stderr,
             )
