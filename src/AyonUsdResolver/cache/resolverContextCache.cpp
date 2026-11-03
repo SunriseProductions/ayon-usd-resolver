@@ -38,14 +38,26 @@ static std::mutex s_memcachedMutex;
 static std::string _ToRootlessPath(
     const std::string &resolvedPath,
     const std::unordered_map<std::string, std::string> &rootReplaceData) {
-    std::string rootlessPath = resolvedPath;
+    // Whole path segments only (root /mnt/work must not match /mnt/work2/...), and the longest matching root wins
+    // (a nested root beats its parent), independent of the map's iteration order.
+    const std::string *bestKey = nullptr;
+    size_t bestLen = 0;
     for (const auto &[key, root] : rootReplaceData) {
-        if (!root.empty() && rootlessPath.rfind(root, 0) == 0) {
-            rootlessPath = "{root[" + key + "]}" + rootlessPath.substr(root.size());
-            break;
+        if (root.empty() || root.size() <= bestLen || resolvedPath.rfind(root, 0) != 0) {
+            continue;
+        }
+        const char last = root.back();
+        const bool boundary = resolvedPath.size() == root.size() || last == '/' || last == '\\'
+                              || resolvedPath[root.size()] == '/' || resolvedPath[root.size()] == '\\';
+        if (boundary) {
+            bestKey = &key;
+            bestLen = root.size();
         }
     }
-    return rootlessPath;
+    if (bestKey == nullptr) {
+        return resolvedPath;
+    }
+    return "{root[" + *bestKey + "]}" + resolvedPath.substr(bestLen);
 }
 
 // True when rootReplace left a "{root[...]}" template in place: the site roots failed to load (fetched
@@ -551,9 +563,11 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
         // Failed resolve = (uri, ""): getAssetIdent sets the uri before the missing entity throws.
         // A transport failure returns an empty pair instead and is NOT a miss.
         const bool isMiss = !asset.getAssetIdentifier().empty() && asset.getResolvedAssetPath().empty();
-        this->insert(asset);
-        if (isMiss) {
-            _StoreMiss(assetIdentifier);
+        // A miss with a marker stays out of the in-process caches: the marker is the negative cache, and
+        // a PreCache entry would outlive it and hide a later publish for the life of the process.
+        // Without a marker (memcached off, miss caching disabled), keep the in-process entry as before.
+        if (!isMiss || !_StoreMiss(assetIdentifier)) {
+            this->insert(asset);
         }
 
         // Also store in memcached for distributed caching.
@@ -579,7 +593,8 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
         if (!asset.getResolvedAssetPath().empty()) {
             asset.setAssetIdentifier(assetIdentifier);
 
-            std::shared_lock<std::shared_mutex> CommonCacheSharedLock(m_CommonCacheSharedMutex);
+            // insert() mutates the set: exclusive lock (a shared one let concurrent resolves race).
+            std::unique_lock<std::shared_mutex> CommonCacheWriteLock(m_CommonCacheSharedMutex);
 
             TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
                 .Msg("ResolverContextCache::getAsset: insert into CommonCache \n");
@@ -650,8 +665,13 @@ ResolverContextCache::removeCachedObject(const std::string &key) {
         return;
     }
 
+    CommonCachesharedWriteLock.unlock();
+    AyonCachesharedWriteLock.unlock();
+    preCacheSharedWriteLock.unlock();
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
         .Msg("ResolverContextCache::removeCachedObject the object could not be found");
+    // A known miss has no local asset (markers stay out of the in-process caches); drop its marker.
+    _DeleteMissMarker(key);
 };
 
 void
@@ -712,9 +732,11 @@ ResolverContextCache::removeCachedObject(const std::string &key, const CacheName
                 }
         }
     }
+    preCacheSharedDeleteLock.unlock();
 
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
         .Msg("ResolverContextCache::removeCachedObject the object could not be found");
+    _DeleteMissMarker(key);
 };
 
 void
@@ -725,12 +747,14 @@ ResolverContextCache::ClearCache() {
     std::unique_lock<std::shared_mutex> AyonCachesharedMutexLock(m_AyonCacheSharedMutex);
     std::unique_lock<std::shared_mutex> CommonCachesharedMutexLock(m_CommonCacheSharedMutex);
     // Only PreCache/AyonCache can hold keys written to memcached (CommonCache is non-AYON paths).
-    // Mutable (hero/latest) keys of this session are deleted from memcached; immutable ones stay.
+    // Mutable (hero/latest) keys of this session are deleted from memcached; immutable ones stay. A class
+    // that bypasses memcached (TTL -1, `latest` by default) never wrote its keys, so they are not deleted.
     std::vector<std::string> mutableKeys;
     for (const auto *cache: {&m_PreCache, &m_AyonCache}) {
         for (const auto &asset: *cache) {
-            if (MemcachedExpiry::classifyUri(asset.getAssetIdentifier()) != MemcachedExpiry::VersionClass::Immutable) {
-                mutableKeys.push_back(asset.getAssetIdentifier());
+            std::string uri = asset.getAssetIdentifier();
+            if (MemcachedExpiry::classifyUri(uri) != MemcachedExpiry::VersionClass::Immutable && _MemcachedTtl(uri) >= 0) {
+                mutableKeys.push_back(std::move(uri));
             }
         }
     }
@@ -751,11 +775,10 @@ ResolverContextCache::ClearCache() {
             std::lock_guard<std::mutex> lock(s_memcachedMutex);
             m_memcached->get()->deleteAssetData(key);
         }
-        // Known-miss markers this process saw: drop them too so a fresh resolve re-asks AYON.
-        for (const auto &key: missKeys) {
-            std::lock_guard<std::mutex> lock(s_memcachedMutex);
-            m_memcached->get()->deleteAssetData(key);
-        }
+    }
+    // Known-miss markers this process saw: drop them too so a fresh resolve re-asks AYON.
+    for (const auto &key: missKeys) {
+        _DeleteMissMarker(key);
     }
 };
 
@@ -766,18 +789,44 @@ ResolverContextCache::_TrackMiss(const std::string &uri) {
 }
 
 void
+ResolverContextCache::_DeleteMissMarker(const std::string &uri) {
+    {
+        std::lock_guard<std::mutex> lock(m_missKeysMutex);
+        m_missKeys.erase(uri);
+    }
+    if (!m_memcached.has_value() || !m_memcached->get()->isConnected() || _MemcachedTtl(uri) < 0) {
+        return;
+    }
+    // Delete only while the key still holds the marker: a path stored since (by this or another process,
+    // e.g. after a publish) must survive. memcached has no conditional delete, so a path written between
+    // this get and the delete is still dropped; that costs one extra AYON lookup, never a wrong path.
+    std::lock_guard<std::mutex> lock(s_memcachedMutex);
+    const AssetIdentifier current = m_memcached->get()->getAssetData(uri);
+    if (!current.isEmpty() && MemcachedExpiry::isMissMarker(current.getResolvedAssetPath().GetPathString())) {
+        m_memcached->get()->deleteAssetData(uri);
+    }
+}
+
+bool
 ResolverContextCache::_StoreMiss(const std::string &uri) {
     const int64_t ttl = MemcachedExpiry::missTtlFor(_MemcachedTtl(uri), m_memcachedMissExpire);
     if (!m_memcached.has_value() || !m_memcached->get()->isConnected() || ttl < 0) {
-        return;
+        return false;
     }
+    bool stored = false;
     {
         std::lock_guard<std::mutex> lock(s_memcachedMutex);
-        m_memcached->get()->setAssetData(uri, MemcachedExpiry::kMissMarker, static_cast<uint32_t>(ttl));
+        // add, not set: a path another process stored after our AYON lookup (e.g. a publish) is kept, and we do not
+        // keep the miss in-process either (returns true: memcached holds the answer).
+        stored = m_memcached->get()->addMissMarker(uri, static_cast<uint32_t>(ttl));
+    }
+    if (!stored) {
+        return false;
     }
     _TrackMiss(uri);
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
         .Msg("ResolverContextCache: stored miss marker (%ld s) for %s\n", static_cast<long>(ttl), uri.c_str());
+    return true;
 }
 
 bool
