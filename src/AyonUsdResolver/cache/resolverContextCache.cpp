@@ -574,7 +574,10 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
     }
 
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT).Msg("ResolverContextCache::getAsset: No Cache Hit \n");
-    if (isAyonPath && m_ayon.has_value()) {
+    if (isAyonPath) {
+        if (!m_ayon.has_value()) {
+            return asset;   // no AYON connection (see the constructor): unresolved, like any failed lookup
+        }
         std::pair<std::string, std::string> resolvedAsset = m_ayon->get()->resolvePath(assetIdentifier);
 
         asset.setAssetIdentifier(std::move(resolvedAsset.first));
