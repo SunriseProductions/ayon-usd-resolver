@@ -323,6 +323,9 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
             resolved.emplace(uriPath, *cached);
             continue;
         }
+        if (m_knownMisses.isKnown(uriPath)) {
+            continue;
+        }
         pending.push_back(uriPath);
     }
     if (pending.empty()) {
@@ -339,13 +342,14 @@ ResolverContextCache::batchWarm(std::vector<std::string> &uriPaths) {
             // it for a whole frontier would stall every other resolver thread's memcached path
             // for the length of the prewarm.
             AssetIdentifier asset;
+            const uint64_t observedAt = m_knownMisses.generation();
             if (_MemcachedTtl(uriPath) >= 0) {
                 std::lock_guard<std::mutex> lock(s_memcachedMutex);
                 asset = m_memcached->get()->getAssetData(uriPath);
             }
             if (!asset.isEmpty() && MemcachedExpiry::isMissMarker(asset.getResolvedAssetPath().GetPathString())) {
                 // Known miss: AYON had no path for it recently. Skip the API call; do not cache or return it.
-                _TrackMiss(uriPath);
+                _TrackMiss(uriPath, observedAt);
                 continue;
             }
             if (asset.isEmpty()) {
@@ -493,8 +497,14 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
 
     // Try memcached as second-level cache before calling REST API
     if (m_memcached.has_value() && m_memcached->get()->isConnected() && _MemcachedTtl(assetIdentifier) >= 0) {
+        if (m_knownMisses.isKnown(assetIdentifier)) {
+            AssetIdentifier miss;
+            miss.setAssetIdentifier(assetIdentifier);
+            return miss;
+        }
         // Release s_memcachedMutex before insert(): insert() takes the cache locks, and
         // ClearCache() takes them in the opposite order (cache locks, then s_memcachedMutex).
+        const uint64_t observedAt = m_knownMisses.generation();
         {
             std::lock_guard<std::mutex> lock(s_memcachedMutex);
             TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT).Msg("ResolverContextCache::getAsset: Checking memcached\n");
@@ -502,7 +512,7 @@ ResolverContextCache::getAsset(const std::string &assetIdentifier,
         }
         if (!asset.isEmpty() && MemcachedExpiry::isMissMarker(asset.getResolvedAssetPath().GetPathString())) {
             // Known miss: return what a failed resolve returns (identifier set, empty path), without calling AYON.
-            _TrackMiss(assetIdentifier);
+            _TrackMiss(assetIdentifier, observedAt);
             AssetIdentifier miss;
             miss.setAssetIdentifier(assetIdentifier);
             return miss;
@@ -736,11 +746,6 @@ ResolverContextCache::ClearCache() {
     }
 
     // Cache locks are released above so s_memcachedMutex is never held together with them.
-    std::unordered_set<std::string> missKeys;
-    {
-        std::lock_guard<std::mutex> lock(m_missKeysMutex);
-        missKeys.swap(m_missKeys);
-    }
     if (m_memcached.has_value() && m_memcached->get()->isConnected()) {
         for (const auto &key: mutableKeys) {
             std::lock_guard<std::mutex> lock(s_memcachedMutex);
@@ -748,34 +753,33 @@ ResolverContextCache::ClearCache() {
         }
     }
     // Known-miss markers this process saw: drop them too so a fresh resolve re-asks AYON.
-    for (const auto &key: missKeys) {
-        _DeleteMissMarker(key);
+    for (const auto &uri: m_knownMisses.keys()) {
+        _DeleteMissMarker(uri);
     }
 };
 
 void
-ResolverContextCache::_TrackMiss(const std::string &uri) {
-    std::lock_guard<std::mutex> lock(m_missKeysMutex);
-    m_missKeys.insert(uri);
+ResolverContextCache::_TrackMiss(const std::string &uri, uint64_t observedAt, bool trust) {
+    const int64_t window
+        = trust ? MemcachedExpiry::knownMissWindowFor(MemcachedExpiry::missTtlFor(_MemcachedTtl(uri), m_memcachedMissExpire))
+                : 0;
+    m_knownMisses.track(uri, window, observedAt);
 }
 
 void
 ResolverContextCache::_DeleteMissMarker(const std::string &uri) {
-    {
-        std::lock_guard<std::mutex> lock(m_missKeysMutex);
-        m_missKeys.erase(uri);
+    if (m_memcached.has_value() && m_memcached->get()->isConnected() && _MemcachedTtl(uri) >= 0) {
+        // Delete only while the key still holds the marker: a path stored since (by this or another process,
+        // e.g. after a publish) must survive. memcached has no conditional delete, so a path written between
+        // this get and the delete is still dropped; that costs one extra AYON lookup, never a wrong path.
+        std::lock_guard<std::mutex> lock(s_memcachedMutex);
+        const AssetIdentifier current = m_memcached->get()->getAssetData(uri);
+        if (!current.isEmpty() && MemcachedExpiry::isMissMarker(current.getResolvedAssetPath().GetPathString())) {
+            m_memcached->get()->deleteAssetData(uri);
+        }
     }
-    if (!m_memcached.has_value() || !m_memcached->get()->isConnected() || _MemcachedTtl(uri) < 0) {
-        return;
-    }
-    // Delete only while the key still holds the marker: a path stored since (by this or another process,
-    // e.g. after a publish) must survive. memcached has no conditional delete, so a path written between
-    // this get and the delete is still dropped; that costs one extra AYON lookup, never a wrong path.
-    std::lock_guard<std::mutex> lock(s_memcachedMutex);
-    const AssetIdentifier current = m_memcached->get()->getAssetData(uri);
-    if (!current.isEmpty() && MemcachedExpiry::isMissMarker(current.getResolvedAssetPath().GetPathString())) {
-        m_memcached->get()->deleteAssetData(uri);
-    }
+    // Last, so that a marker read while it was still there is not trusted (see KnownMisses).
+    m_knownMisses.forget(uri);
 }
 
 bool
@@ -784,17 +788,18 @@ ResolverContextCache::_StoreMiss(const std::string &uri) {
     if (!m_memcached.has_value() || !m_memcached->get()->isConnected() || ttl < 0) {
         return false;
     }
-    bool stored = false;
+    MissMarkerWrite write = MissMarkerWrite::Failed;
+    const uint64_t observedAt = m_knownMisses.generation();
     {
         std::lock_guard<std::mutex> lock(s_memcachedMutex);
         // add, not set: a path another process stored after our AYON lookup (e.g. a publish) is kept, and we do not
         // keep the miss in-process either (returns true: memcached holds the answer).
-        stored = m_memcached->get()->addMissMarker(uri, static_cast<uint32_t>(ttl));
+        write = m_memcached->get()->addMissMarker(uri, static_cast<uint32_t>(ttl));
     }
-    if (!stored) {
+    if (write == MissMarkerWrite::Failed) {
         return false;
     }
-    _TrackMiss(uri);
+    _TrackMiss(uri, observedAt, write == MissMarkerWrite::Stored);
     TF_DEBUG(AYONUSDRESOLVER_RESOLVER_CONTEXT)
         .Msg("ResolverContextCache: stored miss marker (%ld s) for %s\n", static_cast<long>(ttl), uri.c_str());
     return true;
